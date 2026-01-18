@@ -353,6 +353,33 @@ class WBFMerger:
         return boxes, scores, labels
 
 
+def _extract_inference_predictions(expert_output):
+    """
+    從專家輸出中提取推論用的預測
+
+    YOLOv7 Detect 層輸出格式:
+    - 訓練時: list of tensors (每個 detection scale 一個)
+    - 推論時: (processed_predictions, raw_predictions) tuple
+             processed_predictions shape: [B, N, 5+nc]
+
+    Args:
+        expert_output: 專家的原始輸出
+
+    Returns:
+        tensor [B, N, 5+nc]: 處理後的預測
+    """
+    if isinstance(expert_output, tuple):
+        # 推論模式: 取第一個元素 (processed predictions)
+        return expert_output[0]
+    elif isinstance(expert_output, list):
+        # 訓練模式的輸出 (不應該在推論時出現，但做防護)
+        # 需要手動處理，這裡簡單返回 None
+        return None
+    else:
+        # 已經是正確格式
+        return expert_output
+
+
 def apply_wbf_to_moe_output(moe_output, img_size, iou_thr=0.55, conf_thr=0.001):
     """
     便捷函數：對 MoE 模型輸出應用 WBF
@@ -378,6 +405,13 @@ def apply_wbf_to_moe_output(moe_output, img_size, iou_thr=0.55, conf_thr=0.001):
 
     all_results = []
 
+    # 預處理：提取推論預測
+    processed_outputs = {}
+    for expert_idx, output in expert_outputs.items():
+        pred = _extract_inference_predictions(output)
+        if pred is not None:
+            processed_outputs[expert_idx] = pred
+
     for b in range(batch_size):
         # 取得這張圖選中的專家和權重
         indices = top_indices[b].cpu().numpy()
@@ -389,9 +423,9 @@ def apply_wbf_to_moe_output(moe_output, img_size, iou_thr=0.55, conf_thr=0.001):
 
         for i, (expert_idx, weight) in enumerate(zip(indices, weights)):
             expert_idx = int(expert_idx)
-            if expert_idx in expert_outputs:
+            if expert_idx in processed_outputs:
                 # 只取這張圖的預測
-                selected_outputs[expert_idx] = expert_outputs[expert_idx][b:b+1]
+                selected_outputs[expert_idx] = processed_outputs[expert_idx][b:b+1]
                 selected_weights[expert_idx] = float(weight)
 
         # WBF 合併

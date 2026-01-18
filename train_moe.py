@@ -185,6 +185,10 @@ def train_moe(hyp, opt, device):
                 f'Logging results to {save_dir}\n'
                 f'Starting training for {epochs} epochs...')
 
+    # 寫入 results 文件標題
+    with open(results_file, 'w') as f:
+        f.write('epoch\tbox\tobj\tcls\ttotal\tP\tR\tmAP@0.5\tmAP@0.5:0.95\n')
+
     # Expert usage tracking
     expert_usage_history = []
 
@@ -267,12 +271,14 @@ def train_moe(hyp, opt, device):
         # ============ Validation ============
         ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights'])
 
-        # Simple validation: compute loss on validation set
-        val_loss = validate_moe(model, testloader, compute_loss, device)
-        logger.info(f"Validation loss: {val_loss:.4f}")
+        # 完整 mAP 驗證
+        mp, mr, map50, map_val, val_loss = validate_moe(
+            model, testloader, compute_loss, device, nc, names
+        )
+        logger.info(f"Validation: P={mp:.3f}, R={mr:.3f}, mAP@0.5={map50:.3f}, mAP@0.5:0.95={map_val:.3f}")
 
-        # Use validation loss as fitness (lower is better)
-        fi = -val_loss  # negative because we want to maximize fitness
+        # 使用 mAP@0.5 作為 fitness
+        fi = map50
 
         # Save
         if fi > best_fitness:
@@ -287,6 +293,7 @@ def train_moe(hyp, opt, device):
             'expert_usage_history': expert_usage_history,
             'hyp': hyp,
             'opt': vars(opt),
+            'results': (mp, mr, map50, map_val),  # 保存驗證結果
         }
 
         # Save last and best
@@ -296,7 +303,8 @@ def train_moe(hyp, opt, device):
 
         # Log
         with open(results_file, 'a') as f:
-            f.write(f'{epoch}\t{mloss[0]:.4f}\t{mloss[1]:.4f}\t{mloss[2]:.4f}\t{mloss[3]:.4f}\t{val_loss:.4f}\n')
+            f.write(f'{epoch}\t{mloss[0]:.4f}\t{mloss[1]:.4f}\t{mloss[2]:.4f}\t{mloss[3]:.4f}\t'
+                    f'{mp:.4f}\t{mr:.4f}\t{map50:.4f}\t{map_val:.4f}\n')
 
         del ckpt
 
@@ -309,30 +317,134 @@ def train_moe(hyp, opt, device):
     return results
 
 
-def validate_moe(model, dataloader, compute_loss, device):
+def validate_moe(model, dataloader, compute_loss, device, nc, names, conf_thres=0.001, iou_thres=0.6):
     """
-    簡單的驗證函數
+    MoE 模型驗證函數，計算 mAP
+
+    Args:
+        model: MoEYOLOv7 模型
+        dataloader: 驗證資料載入器
+        compute_loss: loss 計算器
+        device: 計算裝置
+        nc: 類別數量
+        names: 類別名稱
+        conf_thres: 置信度閾值
+        iou_thres: NMS IoU 閾值
+
+    Returns:
+        results: (mp, mr, map50, map, val_loss)
     """
+    from utils.metrics import ap_per_class
+    from utils.general import box_iou, xywh2xyxy, scale_coords
+    from models.wbf import apply_wbf_to_moe_output
+
     model.eval()
-    total_loss = 0
+
+    iouv = torch.linspace(0.5, 0.95, 10).to(device)  # IoU 向量 for mAP@0.5:0.95
+    niou = iouv.numel()
+
+    seen = 0
+    stats = []
+    total_loss = torch.zeros(3, device=device)
     n_batches = 0
 
+    pbar = tqdm(dataloader, desc='Validating')
+
     with torch.no_grad():
-        for imgs, targets, _, _ in dataloader:
+        for batch_i, (imgs, targets, paths, shapes) in enumerate(pbar):
             imgs = imgs.to(device, non_blocking=True).float() / 255.0
             targets = targets.to(device)
+            nb, _, height, width = imgs.shape
 
-            moe_output = model(imgs)
-            loss, _ = compute_loss(moe_output, targets)
-
-            total_loss += loss.item()
+            # Forward (訓練模式以獲取 loss)
+            model.train()
+            moe_output_train = model(imgs)
+            loss, loss_items = compute_loss(moe_output_train, targets)
+            total_loss += loss_items[:3]
             n_batches += 1
 
-            if n_batches >= 50:  # Limit validation batches for speed
-                break
+            # Forward (推論模式以獲取預測)
+            model.eval()
+            moe_output = model(imgs)
+
+            # WBF 合併專家輸出
+            img_size = (height, width)
+            out = apply_wbf_to_moe_output(
+                moe_output,
+                img_size=img_size,
+                iou_thr=0.55,
+                conf_thr=conf_thres
+            )
+
+            # 將 targets 轉換為像素座標
+            targets[:, 2:] *= torch.tensor([width, height, width, height], device=device)
+
+            # 統計每張圖片
+            for si, pred in enumerate(out):
+                labels = targets[targets[:, 0] == si, 1:]
+                nl = len(labels)
+                tcls = labels[:, 0].tolist() if nl else []
+                seen += 1
+
+                if len(pred) == 0:
+                    if nl:
+                        stats.append((torch.zeros(0, niou, dtype=torch.bool),
+                                     torch.Tensor(), torch.Tensor(), tcls))
+                    continue
+
+                # 預測結果
+                pred = pred.to(device)
+                predn = pred.clone()
+
+                # 縮放到原始圖片尺寸
+                if shapes is not None:
+                    scale_coords(imgs[si].shape[1:], predn[:, :4], shapes[si][0], shapes[si][1])
+
+                # 評估
+                correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
+                if nl:
+                    detected = []
+                    tcls_tensor = labels[:, 0]
+
+                    # target boxes
+                    tbox = xywh2xyxy(labels[:, 1:5])
+                    if shapes is not None:
+                        scale_coords(imgs[si].shape[1:], tbox, shapes[si][0], shapes[si][1])
+
+                    # 對每個類別
+                    for cls in torch.unique(tcls_tensor):
+                        ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)
+                        pi = (cls == pred[:, 5]).nonzero(as_tuple=False).view(-1)
+
+                        if pi.shape[0]:
+                            ious, i = box_iou(predn[pi, :4], tbox[ti]).max(1)
+
+                            detected_set = []
+                            for j in (ious > iouv[0]).nonzero(as_tuple=False):
+                                d = ti[i[j]]
+                                if d.item() not in detected_set:
+                                    detected_set.append(d.item())
+                                    detected.append(d)
+                                    correct[pi[j]] = ious[j] > iouv
+                                    if len(detected) == nl:
+                                        break
+
+                stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
+
+    # 計算指標
+    stats = [np.concatenate(x, 0) for x in zip(*stats)]
+    if len(stats) and stats[0].any():
+        p, r, ap, f1, ap_class = ap_per_class(*stats, plot=False, names=names)
+        ap50, ap = ap[:, 0], ap.mean(1)
+        mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
+    else:
+        mp, mr, map50, map = 0.0, 0.0, 0.0, 0.0
+
+    # 平均 loss
+    val_loss = (total_loss / max(n_batches, 1)).cpu().numpy()
 
     model.train()
-    return total_loss / max(n_batches, 1)
+    return mp, mr, map50, map, val_loss
 
 
 if __name__ == '__main__':

@@ -319,6 +319,11 @@ class ComputeLossMoESimple:
     簡化版 MoE Loss 計算
 
     直接對所有被選中專家的 loss 加權平均，不區分每個 batch 樣本
+
+    Loss 計算與原版 YOLOv7 保持一致，包含:
+    - cls_pw, obj_pw (positive weight)
+    - fl_gamma (focal loss)
+    - label_smoothing (cp, cn)
     """
 
     def __init__(self, model, autobalance=False, aux_loss_weight=0.01):
@@ -330,14 +335,50 @@ class ComputeLossMoESimple:
         """
         self.aux_loss_weight = aux_loss_weight
         self.model = model
+        self.autobalance = autobalance
+        self.hyp = None
 
-        # 為每個專家創建獨立的 loss 計算器
-        self.expert_loss_computers = {}
+        # Loss 相關屬性，在 set_hyp 時初始化
+        self.BCEcls = None
+        self.BCEobj = None
+        self.cp = 1.0  # positive class label
+        self.cn = 0.0  # negative class label
+        self.gr = 1.0  # giou loss ratio
+        self.balance = [4.0, 1.0, 0.4]
 
     def set_hyp(self, hyp):
-        """設定超參數"""
+        """設定超參數並初始化 loss 函數"""
         self.hyp = hyp
         self.model.hyp = hyp
+
+        device = next(self.model.parameters()).device
+
+        # BCE losses with positive weights
+        cls_pw = hyp.get('cls_pw', 1.0)
+        obj_pw = hyp.get('obj_pw', 1.0)
+        BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([cls_pw], device=device))
+        BCEobj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([obj_pw], device=device))
+
+        # Label smoothing
+        from utils.loss import smooth_BCE
+        self.cp, self.cn = smooth_BCE(eps=hyp.get('label_smoothing', 0.0))
+
+        # Focal loss
+        from utils.loss import FocalLoss
+        fl_gamma = hyp.get('fl_gamma', 0.0)
+        if fl_gamma > 0:
+            BCEcls = FocalLoss(BCEcls, fl_gamma)
+            BCEobj = FocalLoss(BCEobj, fl_gamma)
+
+        self.BCEcls = BCEcls
+        self.BCEobj = BCEobj
+
+        # GIoU loss ratio
+        self.gr = hyp.get('gr', 1.0)
+
+        # Detection layer balance
+        nl = 3  # YOLOv7-tiny has 3 detection layers
+        self.balance = {3: [4.0, 1.0, 0.4]}.get(nl, [4.0, 1.0, 0.25, 0.06, 0.02])
 
     def __call__(self, moe_output, targets):
         """
@@ -400,12 +441,15 @@ class ComputeLossMoESimple:
         """
         計算單一專家的 loss
 
-        這裡我們直接使用原始的 ComputeLoss 邏輯
+        使用與原版 YOLOv7 相同的 loss 計算邏輯，包含:
+        - cls_pw, obj_pw (通過 self.BCEcls, self.BCEobj)
+        - fl_gamma (focal loss，已在 set_hyp 中應用到 BCE)
+        - label_smoothing (通過 self.cp, self.cn)
         """
         from utils.general import bbox_iou
 
         device = targets.device
-        hyp = getattr(self, 'hyp', None) or self.model.hyp
+        hyp = self.hyp
 
         if hyp is None:
             # 使用預設值
@@ -436,12 +480,20 @@ class ComputeLossMoESimple:
         # Build targets
         tcls, tbox, indices, anch = self._build_targets_simple(pred, targets, anchors, na, nl, hyp)
 
-        # BCE losses
-        BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([1.0], device=device))
-        BCEobj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([1.0], device=device))
+        # 使用已初始化的 BCE losses (包含 pos_weight 和 focal loss)
+        BCEcls = self.BCEcls
+        BCEobj = self.BCEobj
 
-        balance = [4.0, 1.0, 0.4]
-        gr = 1.0
+        # 如果 set_hyp 還沒被調用，使用預設值
+        if BCEcls is None:
+            BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([1.0], device=device))
+            BCEobj = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([1.0], device=device))
+
+        # 使用已初始化的參數
+        balance = self.balance
+        gr = self.gr
+        cp = self.cp  # positive class label (with label smoothing)
+        cn = self.cn  # negative class label (with label smoothing)
 
         for i, pi in enumerate(pred):
             b, a, gj, gi = indices[i]
@@ -451,22 +503,27 @@ class ComputeLossMoESimple:
             if n:
                 ps = pi[b, a, gj, gi]
 
+                # Regression (box loss)
                 pxy = ps[:, :2].sigmoid() * 2. - 0.5
                 pwh = (ps[:, 2:4].sigmoid() * 2) ** 2 * anch[i]
                 pbox = torch.cat((pxy, pwh), 1)
                 iou = bbox_iou(pbox.T, tbox[i], x1y1x2y2=False, CIoU=True)
                 lbox += (1.0 - iou).mean()
 
+                # Objectness target (使用 gr 參數)
                 tobj[b, a, gj, gi] = (1.0 - gr) + gr * iou.detach().clamp(0).type(tobj.dtype)
 
+                # Classification (使用 label smoothing: cp, cn)
                 if nc > 1:
-                    t = torch.full_like(ps[:, 5:], 0.0, device=device)
-                    t[range(n), tcls[i]] = 1.0
+                    t = torch.full_like(ps[:, 5:], cn, device=device)  # 負類用 cn
+                    t[range(n), tcls[i]] = cp  # 正類用 cp
                     lcls += BCEcls(ps[:, 5:], t)
 
+            # Objectness loss (使用 balance 權重)
             obji = BCEobj(pi[..., 4], tobj)
             lobj += obji * balance[i] if i < len(balance) else obji
 
+        # 乘以超參數權重
         lbox *= hyp['box']
         lobj *= hyp['obj']
         lcls *= hyp['cls']
