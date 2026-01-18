@@ -178,18 +178,40 @@ class MoEYOLOv7(nn.Module):
             專家的預測輸出
         """
         # 初始化 cache，包含 backbone 的關鍵輸出
+        # 使用 dict 存儲，key 是絕對層索引
         y = {14: backbone_cache[14], 21: backbone_cache[21], 28: backbone_cache[28]}
         x = backbone_cache[28]  # 從 P5 開始
 
         for i, m in enumerate(expert_layers):
-            layer_idx = i + 29  # 實際層索引
+            layer_idx = i + 29  # 實際層索引 (絕對索引)
 
             # 處理 skip connection
             if m.f != -1:
                 if isinstance(m.f, int):
-                    x = y.get(m.f, x)
+                    # 單一來源
+                    if m.f < 0:
+                        # 負數 = 相對索引，轉換為絕對索引
+                        # 例如: layer_idx=36, m.f=-7 → 36-7=29
+                        abs_idx = layer_idx + m.f
+                    else:
+                        # 正數 = 絕對索引
+                        abs_idx = m.f
+                    x = y[abs_idx]
                 else:
-                    x = [y.get(j, x) if j != -1 else x for j in m.f]
+                    # 多個來源 (Concat)
+                    inputs = []
+                    for j in m.f:
+                        if j == -1:
+                            # -1 表示前一層的輸出 (當前的 x)
+                            inputs.append(x)
+                        elif j < 0:
+                            # 負數相對索引
+                            abs_idx = layer_idx + j
+                            inputs.append(y[abs_idx])
+                        else:
+                            # 正數絕對索引
+                            inputs.append(y[j])
+                    x = inputs
 
             # Forward
             x = m(x)
