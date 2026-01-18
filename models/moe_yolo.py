@@ -194,9 +194,8 @@ class MoEYOLOv7(nn.Module):
             # Forward
             x = m(x)
 
-            # 保存輸出
-            if layer_idx in self.expert_save:
-                y[layer_idx] = x
+            # 保存所有層的輸出 (skip connection 需要)
+            y[layer_idx] = x
 
         return x
 
