@@ -1,14 +1,13 @@
+# models/moe_yolo.py
 """
-MoE-YOLOv7: Mixture of Experts 版本的 YOLOv7
+MoE-YOLOv7: 共享 Backbone + Router + 多專家 (Neck+Head)
 
 架構:
-- 共享 Backbone (Layer 0-28)
-- Router 選擇 Top-K 專家
-- N 個專家 (Neck + Head)
-- WBF 合併輸出 (推論時)
+- Backbone (Layer 0-28): 共享
+- Router: 根據 P5 選擇 Top-K 專家
+- Experts (Layer 29-77): 4 個獨立的 Neck+Head
 
-訓練: 各專家分別計算 loss，加權總和
-推論: 各專家分別 NMS，用 WBF 合併
+Forward 邏輯完全複製原版 YOLOv7 的 forward_once
 """
 
 import torch
@@ -22,69 +21,50 @@ from models.moe import Router
 
 class MoEYOLOv7(nn.Module):
     """
-    MoE-YOLOv7 使用 WBF 合併
+    MoE-YOLOv7 模型
 
     Args:
-        cfg: 模型配置檔路徑
+        cfg: 模型配置檔路徑 (yolov7-tiny.yaml)
         num_experts: 專家數量
-        top_k: 每張圖選幾個專家
+        top_k: 每張圖選擇的專家數量
         nc: 類別數量
         ch: 輸入通道數
     """
-    def __init__(self, cfg='cfg/training/yolov7-tiny.yaml',
-                 num_experts=4, top_k=2, nc=80, ch=3):
+
+    def __init__(self, cfg='cfg/training/yolov7-tiny.yaml', num_experts=4, top_k=2, nc=80, ch=3):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
         self.nc = nc
 
-        # 載入基礎模型取得結構
+        # 載入原版 Model 取得完整結構
         base_model = Model(cfg, ch=ch, nc=nc)
 
-        # ============ Backbone (共享) ============
-        # YOLOv7-tiny: Layer 0-28
-        backbone_layers = list(base_model.model)[:29]
-        self.backbone = nn.ModuleList(backbone_layers)
+        # 拆分 Backbone (Layer 0-28)
+        self.backbone = nn.ModuleList(list(base_model.model[:29]))
 
-        # 需要保存輸出的層索引 (用於 skip connection)
-        self.backbone_save = [i for i in base_model.save if i < 29]
+        # 建立 Router (P5 通道數: 512 for YOLOv7-tiny)
+        self.router = Router(in_channels=512, num_experts=num_experts, top_k=top_k)
 
-        # ============ Router ============
-        # P5 輸出通道數: 512 for YOLOv7-tiny
-        # 從 cfg 讀取或使用預設值
-        p5_channels = 512
-        self.router = Router(
-            in_channels=p5_channels,
-            num_experts=num_experts,
-            top_k=top_k
-        )
+        # 複製 4 份 Expert (Layer 29-77)
+        expert_layers = list(base_model.model[29:])
+        self.experts = nn.ModuleList([
+            nn.ModuleList(deepcopy(expert_layers)) for _ in range(num_experts)
+        ])
 
-        # ============ Experts (Neck + Head) ============
-        # YOLOv7-tiny: Layer 29-77
-        expert_layers = list(base_model.model)[29:]
-        self.experts = nn.ModuleList()
-        for _ in range(num_experts):
-            self.experts.append(nn.ModuleList(deepcopy(expert_layers)))
-
-        # 專家需要保存輸出的層索引
-        self.expert_save = [i for i in base_model.save if i >= 29]
-
-        # ============ 保存必要資訊 ============
+        # 保存必要屬性（與原版相同）
         self.save = base_model.save
         self.stride = base_model.stride
-        self.names = base_model.names
-        self.yaml = base_model.yaml
+        self.names = base_model.names if hasattr(base_model, 'names') else None
+        self.yaml = base_model.yaml if hasattr(base_model, 'yaml') else None
 
-        # 用於 loss 計算
+        # 訓練相關
         self.gr = 1.0  # giou loss ratio
-        self.hyp = None  # 會在訓練時設定
+        self.hyp = None  # 訓練時設定
 
     def forward(self, x, augment=False, profile=False):
         """
         Forward pass
-
-        訓練時: 返回 dict，包含各專家的預測和權重
-        推論時: 返回 dict，包含各專家的預測 (後續用 WBF 合併)
 
         Args:
             x: 輸入圖片 [B, 3, H, W]
@@ -94,28 +74,20 @@ class MoEYOLOv7(nn.Module):
                 - expert_outputs: {expert_idx: prediction}
                 - top_indices: [B, top_k]
                 - top_weights: [B, top_k]
-                - aux_loss: scalar (僅訓練時)
+                - aux_loss: scalar (訓練時)
         """
-        # 1. Backbone forward
-        backbone_cache = self._backbone_forward(x)
+        # 1. Backbone forward (完全複製原版邏輯)
+        p5, backbone_y = self._forward_backbone(x)
 
         # 2. Router 選擇專家
-        p5 = backbone_cache[28]  # P5 特徵
         top_indices, top_weights = self.router(p5)
 
         # 3. 執行被選中的專家
         expert_outputs = {}
-        batch_size = x.shape[0]
-
-        # 找出所有被選中的專家 (去重)
         unique_experts = top_indices.unique().tolist()
 
         for expert_idx in unique_experts:
-            # 執行這個專家 (對整個 batch)
-            expert_out = self._expert_forward(
-                self.experts[expert_idx],
-                backbone_cache
-            )
+            expert_out = self._forward_expert(expert_idx, backbone_y)
             expert_outputs[expert_idx] = expert_out
 
         # 4. 返回結果
@@ -130,94 +102,52 @@ class MoEYOLOv7(nn.Module):
 
         return result
 
-    def _backbone_forward(self, x):
+    def _forward_backbone(self, x):
         """
-        Backbone forward pass
+        Backbone forward (Layer 0-28)
 
-        Args:
-            x: 輸入 [B, 3, H, W]
-
-        Returns:
-            cache: dict，包含關鍵層的輸出 {layer_idx: tensor}
+        完全複製原版 forward_once 的邏輯
         """
-        cache = {}
         y = []
 
-        for i, m in enumerate(self.backbone):
-            # 處理 skip connection
+        for m in self.backbone:
+            # 處理 skip connection（與原版完全相同）
             if m.f != -1:
-                if isinstance(m.f, int):
-                    x = y[m.f]
-                else:
-                    x = [x if j == -1 else y[j] for j in m.f]
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
 
             # Forward
             x = m(x)
 
-            # 保存輸出
-            if i in self.backbone_save:
-                y.append(x)
-            else:
-                y.append(None)
+            # 保存輸出（與原版完全相同）
+            y.append(x if m.i in self.save else None)
 
-            # 保存關鍵層 (用於 Neck 的 skip connection)
-            if i in [14, 21, 28]:
-                cache[i] = x
+        # x 是 P5 (Layer 28 的輸出)
+        return x, y
 
-        return cache
-
-    def _expert_forward(self, expert_layers, backbone_cache):
+    def _forward_expert(self, expert_idx, backbone_y):
         """
-        單個專家的 forward pass
+        單個專家的 forward (Layer 29-77)
 
-        Args:
-            expert_layers: nn.ModuleList，專家的層
-            backbone_cache: dict，Backbone 輸出
-
-        Returns:
-            專家的預測輸出
+        繼承 Backbone 的 y list，用原版邏輯繼續執行
         """
-        # 初始化 cache，包含 backbone 的關鍵輸出
-        # 使用 dict 存儲，key 是絕對層索引
-        y = {14: backbone_cache[14], 21: backbone_cache[21], 28: backbone_cache[28]}
-        x = backbone_cache[28]  # 從 P5 開始
+        expert = self.experts[expert_idx]
 
-        for i, m in enumerate(expert_layers):
-            layer_idx = i + 29  # 實際層索引 (絕對索引)
+        # 複製 backbone 的 y（避免不同專家互相影響）
+        y = backbone_y.copy()
 
-            # 處理 skip connection
+        # 從 P5 開始（y 的最後一個非 None 元素）
+        x = y[28]  # Layer 28 = P5
+
+        for m in expert:
+            # 處理 skip connection（與原版完全相同）
             if m.f != -1:
-                if isinstance(m.f, int):
-                    # 單一來源
-                    if m.f < 0:
-                        # 負數 = 相對索引，轉換為絕對索引
-                        # 例如: layer_idx=36, m.f=-7 → 36-7=29
-                        abs_idx = layer_idx + m.f
-                    else:
-                        # 正數 = 絕對索引
-                        abs_idx = m.f
-                    x = y[abs_idx]
-                else:
-                    # 多個來源 (Concat)
-                    inputs = []
-                    for j in m.f:
-                        if j == -1:
-                            # -1 表示前一層的輸出 (當前的 x)
-                            inputs.append(x)
-                        elif j < 0:
-                            # 負數相對索引
-                            abs_idx = layer_idx + j
-                            inputs.append(y[abs_idx])
-                        else:
-                            # 正數絕對索引
-                            inputs.append(y[j])
-                    x = inputs
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
 
             # Forward
             x = m(x)
 
-            # 保存所有層的輸出 (skip connection 需要)
-            y[layer_idx] = x
+            # 保存輸出（與原版完全相同）
+            y.append(x if m.i in self.save else None)
 
         return x
 
@@ -225,97 +155,64 @@ class MoEYOLOv7(nn.Module):
         """
         載入預訓練權重
 
-        Args:
-            weights_path: 權重檔案路徑
-            verbose: 是否印出訊息
+        - Backbone: 載入對應權重
+        - Experts: 全部用相同的預訓練權重初始化
         """
         if not Path(weights_path).exists():
-            raise FileNotFoundError(f"Weights file not found: {weights_path}")
+            raise FileNotFoundError(f"Weights not found: {weights_path}")
 
         ckpt = torch.load(weights_path, map_location='cpu', weights_only=False)
 
-        # 處理不同格式的 checkpoint
-        if 'model' in ckpt:
+        # 取得 state_dict
+        if isinstance(ckpt, dict) and 'model' in ckpt:
             state_dict = ckpt['model'].float().state_dict()
         else:
-            state_dict = ckpt
+            state_dict = ckpt.float().state_dict() if hasattr(ckpt, 'state_dict') else ckpt
 
-        # ============ 載入 Backbone ============
+        # 載入 Backbone (Layer 0-28)
         backbone_loaded = 0
-        for k, v in state_dict.items():
-            if k.startswith('model.'):
-                parts = k.split('.')
+        for key, value in state_dict.items():
+            if key.startswith('model.'):
+                parts = key.split('.')
                 layer_idx = int(parts[1])
 
                 if layer_idx < 29:
-                    # Backbone 層
-                    new_key = '.'.join(parts[1:])
+                    # 建立新的 key
+                    new_key = key.replace(f'model.{layer_idx}.', '')
                     try:
-                        self.backbone[layer_idx].load_state_dict(
-                            {'.'.join(parts[2:]): v}, strict=False
-                        )
+                        self.backbone[layer_idx].load_state_dict({new_key: value}, strict=False)
                         backbone_loaded += 1
                     except:
                         pass
 
-        # ============ 載入 Experts ============
-        # 所有專家用相同的預訓練權重初始化
+        # 載入 Experts (Layer 29-77)，所有專家用相同權重
         expert_state = {}
-        for k, v in state_dict.items():
-            if k.startswith('model.'):
-                parts = k.split('.')
+        for key, value in state_dict.items():
+            if key.startswith('model.'):
+                parts = key.split('.')
                 layer_idx = int(parts[1])
 
                 if layer_idx >= 29:
                     new_idx = layer_idx - 29
-                    new_key = '.'.join([str(new_idx)] + parts[2:])
-                    expert_state[new_key] = v
+                    new_key = key.replace(f'model.{layer_idx}.', '')
+                    expert_state[(new_idx, new_key)] = value
 
-        experts_loaded = 0
+        expert_loaded = 0
         for i, expert in enumerate(self.experts):
-            for k, v in expert_state.items():
-                parts = k.split('.')
-                layer_idx = int(parts[0])
+            for (layer_idx, param_key), value in expert_state.items():
                 try:
-                    expert[layer_idx].load_state_dict(
-                        {'.'.join(parts[1:]): v}, strict=False
-                    )
-                    experts_loaded += 1
+                    expert[layer_idx].load_state_dict({param_key: value}, strict=False)
+                    expert_loaded += 1
                 except:
                     pass
 
         if verbose:
             print(f"Loaded pretrained weights from {weights_path}")
-            print(f"  Backbone: {backbone_loaded} parameters")
-            print(f"  Experts: {experts_loaded // self.num_experts} parameters each")
-
-    def get_expert_usage_stats(self):
-        """
-        取得專家使用統計
-
-        Returns:
-            dict: 專家使用相關統計
-        """
-        if self.router.last_probs is not None:
-            probs = self.router.last_probs.mean(dim=0)
-            return {
-                'mean_probs': probs.cpu().numpy(),
-                'aux_loss': self.router.aux_loss.item() if self.router.aux_loss else 0
-            }
-        return None
-
-    def fuse(self):
-        """Fuse Conv2d + BatchNorm2d layers"""
-        print('Fusing layers... ')
-        for module in [self.backbone] + list(self.experts):
-            for m in module:
-                if hasattr(m, 'fuse'):
-                    m.fuse()
-        return self
+            print(f"  Backbone layers: {backbone_loaded}")
+            print(f"  Expert layers: {expert_loaded // self.num_experts} (per expert)")
 
     def info(self, verbose=False):
-        """Print model information"""
-        from utils.torch_utils import model_info
+        """印出模型資訊"""
         n_params = sum(p.numel() for p in self.parameters())
         n_backbone = sum(p.numel() for p in self.backbone.parameters())
         n_router = sum(p.numel() for p in self.router.parameters())
@@ -327,3 +224,4 @@ class MoEYOLOv7(nn.Module):
         print(f"  Router: {n_router:,}")
         print(f"  Expert (x{self.num_experts}): {n_expert:,} each")
         print(f"  Top-K: {self.top_k}")
+        print(f"  Stride: {self.stride.tolist()}")
