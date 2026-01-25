@@ -473,7 +473,7 @@ def train(hyp, opt, device, tb_writer=None):
         pbar = enumerate(dataloader)
         logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'labels', 'img_size'))
         if rank in [-1, 0]:
-            pbar = tqdm(pbar, total=nb)
+            pbar = tqdm(pbar, total=nb, ncols=120, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
         optimizer.zero_grad()
 
         for i, (imgs, targets, paths, _) in pbar:
@@ -575,8 +575,8 @@ def train(hyp, opt, device, tb_writer=None):
             if (not opt.nosave) or final_epoch:
                 ckpt = {'epoch': epoch,
                         'best_fitness': best_fitness,
-                        'model': deepcopy(model.module if is_parallel(model) else model).half(),
-                        'ema': deepcopy(ema.ema).half(),
+                        'model': (model.module if is_parallel(model) else model).state_dict(),
+                        'ema': ema.ema.state_dict(),
                         'updates': ema.updates,
                         'optimizer': optimizer.state_dict(),
                         'moe_config': {

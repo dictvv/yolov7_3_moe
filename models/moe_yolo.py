@@ -133,7 +133,7 @@ class MoEYOLOv7(nn.Module):
         expert = self.experts[expert_idx]
 
         # 複製 backbone 的 y（避免不同專家互相影響）
-        y = backbone_y.copy()
+        y = list(backbone_y)
 
         # 從 P5 開始（y 的最後一個非 None 元素）
         x = y[28]  # Layer 28 = P5
